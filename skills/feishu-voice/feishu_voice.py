@@ -47,52 +47,104 @@ class FeishuVoice:
     # 默认音色
     DEFAULT_VOICE = "zh-CN-XiaoyiNeural"
     
-    def __init__(self, app_id: Optional[str] = None, app_secret: Optional[str] = None, 
-                 target_user: Optional[str] = None, api_key: Optional[str] = None):
+    def __init__(self, app_id: Optional[str] = None, app_secret: Optional[str] = None,
+                 target_user: Optional[str] = None, api_key: Optional[str] = None,
+                 agent_id: str = "main", voice: Optional[str] = None):
         """
         初始化飞书语音发送器
-        
+
         Args:
             app_id: 飞书应用 ID
             app_secret: 飞书应用密钥
             target_user: 默认目标用户 open_id
             api_key: DashScope API Key（可选）
+            agent_id: 当前 Agent ID，用于查找对应的飞书账号配置，默认 main
+            voice: 音色，覆盖配置中的默认音色
         """
         self.app_id = app_id or os.getenv('FEISHU_APP_ID')
         self.app_secret = app_secret or os.getenv('FEISHU_APP_SECRET')
         self.target_user = target_user or os.getenv('FEISHU_TARGET_USER')
         self.api_key = api_key or os.getenv('DASHSCOPE_API_KEY')
-        
+        self.agent_id = agent_id
+        self.voice = voice
+        self._account_voice = None  # 从配置读取的账号音色
+
         # 尝试从 openclaw.json 读取配置
-        if not self.app_id or not self.app_secret or not self.api_key:
-            self._load_config_from_openclaw()
-        
+        if not self.app_id or not self.app_secret or not self.api_key or not self.voice:
+            self._load_config_from_openclaw()        # 打印最终配置信息
+        print(f"[feishu-voice] agent_id={self.agent_id}, app_id={self.app_id}, voice={self.voice or self._account_voice}, target_user={self.target_user}")
+
         # 初始化 TTS
         self.tts_api = TTSAPI(api_key=self.api_key)
     
     def _load_config_from_openclaw(self):
-        """从 openclaw.json 加载配置"""
+        """从 openclaw.json 加载配置，根据 agent_id 找到对应的飞书账号"""
         config_paths = [
             Path.home() / '.openclaw' / 'openclaw.json',
             Path.cwd() / 'openclaw.json',
         ]
-        
+
         for config_path in config_paths:
             if config_path.exists():
                 try:
                     with open(config_path, 'r', encoding='utf-8') as f:
                         config = json.load(f)
-                    
+
                     feishu_config = config.get('channels', {}).get('feishu', {})
+                    bindings = config.get('bindings', [])
+
+                    # 根据 agent_id 找到对应的 feishu account_id
+                    account_id = None
+                    for binding in bindings:
+                        if binding.get('agentId') == self.agent_id:
+                            match = binding.get('match', {})
+                            if match.get('channel') == 'feishu':
+                                account_id = match.get('accountId')
+                                break
+
+                    # 如果没找到绑定，尝试直接把 agent_id 当 account_id 使用（兼容直接传入账号名）
+                    if not account_id:
+                        accounts = feishu_config.get('accounts', {})
+                        if self.agent_id in accounts:
+                            account_id = self.agent_id
+
+                    print(f"[feishu-voice] agent_id={self.agent_id}, found account_id={account_id}")
+
+                    # 如果没找到绑定，尝试用默认逻辑
+                    account_config = None
+                    if account_id:
+                        accounts = feishu_config.get('accounts', {})
+                        account_config = accounts.get(account_id, {})
+                        print(f"[feishu-voice] found account_config: appId={account_config.get('appId')}, voice={account_config.get('voice')}")
+
+                    # 读取配置，优先级：账号配置 > 全局默认配置
+                    if not self.app_id and account_config:
+                        self.app_id = account_config.get('appId')
                     if not self.app_id:
                         self.app_id = feishu_config.get('appId')
+
+                    if not self.app_secret and account_config:
+                        self.app_secret = account_config.get('appSecret')
                     if not self.app_secret:
                         self.app_secret = feishu_config.get('appSecret')
+
+                    if not self._account_voice and account_config:
+                        self._account_voice = account_config.get('voice')
+                    if not self._account_voice:
+                        self._account_voice = feishu_config.get('voice')
+
                     if not self.target_user:
-                        self.target_user = feishu_config.get('allowFrom', [None])[0]
+                        # 尝试从 default 账号读取 allowFrom
+                        if accounts := feishu_config.get('accounts', {}):
+                            default_account = accounts.get('default', {})
+                            if allow_from := default_account.get('allowFrom', []):
+                                self.target_user = allow_from[0]
+                        if not self.target_user:
+                            self.target_user = feishu_config.get('allowFrom', [None])[0]
+
                     if not self.api_key:
                         self.api_key = feishu_config.get('dashscopeApiKey')
-                    
+
                     break
                 except Exception as e:
                     print(f"Warning: Failed to load config from {config_path}: {e}")
@@ -101,31 +153,35 @@ class FeishuVoice:
         """获取飞书 Tenant Access Token"""
         import urllib.request
         import ssl
-        
+
         url = f"{self.FEISHU_API_BASE}/auth/v3/tenant_access_token/internal"
         data = json.dumps({
             "app_id": self.app_id,
             "app_secret": self.app_secret
         }).encode('utf-8')
-        
+
         req = urllib.request.Request(
             url,
             data=data,
             headers={'Content-Type': 'application/json'},
             method='POST'
         )
-        
+
         # 禁用 SSL 验证（如果需要）
         context = ssl.create_default_context()
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
-        
-        with urllib.request.urlopen(req, context=context) as response:
-            result = json.loads(response.read().decode('utf-8'))
-            if result.get('code') == 0:
-                return result['tenant_access_token']
-            else:
-                raise Exception(f"Failed to get token: {result.get('msg')}")
+
+        try:
+            with urllib.request.urlopen(req, context=context) as response:
+                result = json.loads(response.read().decode('utf-8'))
+                if result.get('code') == 0:
+                    return result['tenant_access_token']
+                else:
+                    raise Exception(f"Failed to get token: code={result.get('code')}, msg={result.get('msg')}")
+        except Exception as e:
+            print(f"[feishu-voice] Failed to get tenant_access_token: {e}")
+            raise
     
     def _convert_mp3_to_opus(self, mp3_path: str, opus_path: str) -> str:
         """
@@ -233,12 +289,25 @@ class FeishuVoice:
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
         
-        with urllib.request.urlopen(req, context=context) as response:
-            result = json.loads(response.read().decode('utf-8'))
-            if result.get('code') == 0:
-                return result['data']['file_key']
-            else:
-                raise Exception(f"Upload failed: {result.get('msg')}")
+        try:
+            with urllib.request.urlopen(req, context=context) as response:
+                result = json.loads(response.read().decode('utf-8'))
+                if result.get('code') == 0:
+                    return result['data']['file_key']
+                else:
+                    raise Exception(f"Upload failed: code={result.get('code')}, msg={result.get('msg')}")
+        except urllib.error.HTTPError as e:
+            # 尝试读取飞书返回的详细错误信息
+            try:
+                error_body = e.read().decode('utf-8')
+                print(f"[feishu-voice] API error response: {error_body}")
+            except:
+                pass
+            print(f"[feishu-voice] Failed to upload file: {e}")
+            raise
+        except Exception as e:
+            print(f"[feishu-voice] Failed to upload file: {e}")
+            raise
     
     def _send_voice_message(self, token: str, file_key: str, duration: int, 
                            target_user: Optional[str] = None) -> dict:
@@ -259,9 +328,18 @@ class FeishuVoice:
         
         target = target_user or self.target_user
         if not target:
-            raise ValueError("Target user not specified")
-        
-        url = f"{self.FEISHU_API_BASE}/im/v1/messages?receive_id_type=open_id"
+            raise ValueError("Target not specified. Please use --user to specify target (open_id starts with ou_, chat_id starts with oc_)")
+
+        # 自动判断 receive_id_type
+        if target.startswith('oc_'):
+            receive_id_type = 'chat_id'
+        elif target.startswith('ou_'):
+            receive_id_type = 'open_id'
+        else:
+            # 默认 open_id
+            receive_id_type = 'open_id'
+
+        url = f"{self.FEISHU_API_BASE}/im/v1/messages?receive_id_type={receive_id_type}"
         
         data = json.dumps({
             "receive_id": target,
@@ -286,12 +364,25 @@ class FeishuVoice:
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
         
-        with urllib.request.urlopen(req, context=context) as response:
-            result = json.loads(response.read().decode('utf-8'))
-            if result.get('code') == 0:
-                return result['data']
-            else:
-                raise Exception(f"Send failed: {result.get('msg')}")
+        try:
+            with urllib.request.urlopen(req, context=context) as response:
+                result = json.loads(response.read().decode('utf-8'))
+                if result.get('code') == 0:
+                    return result['data']
+                else:
+                    raise Exception(f"Send failed: code={result.get('code')}, msg={result.get('msg')}")
+        except urllib.error.HTTPError as e:
+            # 尝试读取飞书返回的详细错误信息
+            try:
+                error_body = e.read().decode('utf-8')
+                print(f"[feishu-voice] API error response: {error_body}")
+            except:
+                pass
+            print(f"[feishu-voice] Failed to send voice message: {e}")
+            raise
+        except Exception as e:
+            print(f"[feishu-voice] Failed to send voice message: {e}")
+            raise
     
     def _split_text(self, text: str, max_chars: int = 80) -> List[str]:
         """
@@ -377,24 +468,25 @@ class FeishuVoice:
         
         return [s for s in segments if s]
 
-    def send_voice(self, text: str, voice: Optional[str] = None, 
-                   target_user: Optional[str] = None, 
+    def send_voice(self, text: str, voice: Optional[str] = None,
+                   target_user: Optional[str] = None,
                    auto_split: bool = True,
                    max_segment_chars: int = 120) -> List[dict]:
         """
         发送语音消息到飞书（完整流程）
-        
+
         Args:
             text: 要发送的文字
-            voice: 音色，默认使用 DEFAULT_VOICE
+            voice: 音色，优先级：传入参数 > 构造时传入 > 账号配置 > 默认配置
             target_user: 目标用户 open_id
             auto_split: 是否自动分段长文本
             max_segment_chars: 每段最大字符数（建议60-100，对应约15-25秒语音）
-            
+
         Returns:
             发送结果列表，每个元素包含 message_id
         """
-        voice = voice or self.DEFAULT_VOICE
+        # 音色优先级：传入参数 > 构造时传入 > 账号配置 > 默认配置
+        voice = voice or self.voice or self._account_voice or self.DEFAULT_VOICE
         
         # 判断是否需要分段
         if auto_split and len(text) > max_segment_chars:
@@ -407,37 +499,45 @@ class FeishuVoice:
         
         results = []
         token = None
-        
+
+        print(f"[feishu-voice] Starting send_voice, {len(segments)} segment(s) to send")
         for i, segment in enumerate(segments, 1):
             if len(segments) > 1:
-                print(f"\n发送第 {i}/{len(segments)} 段...")
-            
+                print(f"\n[feishu-voice] 发送第 {i}/{len(segments)} 段...")
+
             # 创建临时目录
             with tempfile.TemporaryDirectory() as temp_dir:
                 # 1. 生成 TTS
                 mp3_path = os.path.join(temp_dir, 'voice.mp3')
+                print(f"[feishu-voice] Generating TTS to {mp3_path}...")
                 self.tts_api.tts(segment, mp3_path, voice)
                 
                 # 2. 获取音频时长
                 duration = self._get_audio_duration(mp3_path)
-                
+                print(f"[feishu-voice] TTS generated, duration: {duration}ms")
+
                 # 3. 转换为 OPUS
                 opus_path = os.path.join(temp_dir, 'voice.opus')
+                print(f"[feishu-voice] Converting MP3 to OPUS...")
                 self._convert_mp3_to_opus(mp3_path, opus_path)
-                
+
                 # 4. 获取 Token（只获取一次）
                 if token is None:
+                    print(f"[feishu-voice] Getting tenant access token...")
                     token = self._get_tenant_access_token()
-                
+                    print(f"[feishu-voice] Got access token")
+
                 # 5. 上传文件
+                print(f"[feishu-voice] Uploading audio file to Feishu...")
                 file_key = self._upload_file(token, opus_path, duration)
                 
                 # 6. 发送消息
+                print(f"[feishu-voice] Sending voice message...")
                 result = self._send_voice_message(token, file_key, duration, target_user)
                 results.append(result)
-                
+
                 if len(segments) > 1:
-                    print(f"  ✅ 第 {i} 段发送成功")
+                    print(f"[feishu-voice] ✅ 第 {i} 段发送成功")
         
         return results if len(results) > 1 else results[0]
 
@@ -445,20 +545,21 @@ class FeishuVoice:
 def main():
     """命令行入口"""
     import argparse
-    
+
     parser = argparse.ArgumentParser(description='发送语音消息到飞书')
     parser.add_argument('text', help='要发送的文字')
-    parser.add_argument('--voice', '-v', default='zh-CN-XiaoyiNeural', help='音色')
+    parser.add_argument('--voice', '-v', help='音色，默认使用配置中对应账号的音色')
     parser.add_argument('--user', '-u', help='目标用户 open_id')
+    parser.add_argument('--agent-id', '-a', default='main', help='当前 Agent ID，用于查找对应飞书账号配置（默认 main）')
     parser.add_argument('--no-split', action='store_true', help='禁用自动分段')
     parser.add_argument('--max-chars', type=int, default=80, help='每段最大字符数（默认80）')
-    
+
     args = parser.parse_args()
-    
-    sender = FeishuVoice()
+
+    sender = FeishuVoice(agent_id=args.agent_id, voice=args.voice, target_user=args.user)
     results = sender.send_voice(
-        args.text, 
-        args.voice, 
+        args.text,
+        args.voice,
         args.user,
         auto_split=not args.no_split,
         max_segment_chars=args.max_chars
